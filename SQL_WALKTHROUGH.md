@@ -478,28 +478,298 @@ The reorder cycle score peaks at 14–45 days (3 pts) because that maps cleanly 
 
 ### 6A — Data quality audit
 
-Shows exactly how many rows each cleaning filter removed, in a single stacked `UNION ALL` query. Useful for documenting and presenting the cleaning process.
+```sql
+SELECT 'Total raw rows'                       AS step, COUNT(*) AS row_count
+FROM `my-project-8037-491318.a.a`
+UNION ALL
+SELECT 'After removing nulls customer_id',    COUNT(*)
+FROM `my-project-8037-491318.a.a` WHERE `Customer ID` IS NOT NULL
+UNION ALL
+SELECT 'After removing cancellations',        COUNT(*)
+FROM `my-project-8037-491318.a.a`
+WHERE `Customer ID` IS NOT NULL AND Invoice NOT LIKE 'C%'
+UNION ALL
+SELECT 'After removing non-product codes',    COUNT(*)
+FROM `my-project-8037-491318.a.a`
+WHERE `Customer ID` IS NOT NULL
+  AND Invoice NOT LIKE 'C%'
+  AND REGEXP_CONTAINS(StockCode, r'^\d{5}')
+UNION ALL
+SELECT 'After removing qty and price <= 0',   COUNT(*)
+FROM `my-project-8037-491318.a.a`
+WHERE `Customer ID` IS NOT NULL
+  AND Invoice NOT LIKE 'C%'
+  AND REGEXP_CONTAINS(StockCode, r'^\d{5}')
+  AND Quantity > 0
+  AND Price > 0
+ORDER BY row_count DESC;
+```
+
+**What it does:**
+Runs five `SELECT COUNT(*)` queries stacked together with `UNION ALL` — each one applies one more cleaning filter than the one above it. The result is a single table showing exactly how many rows survive after each step, ordered from largest to smallest.
+
+This is a documentation query — you run it once to verify and present the cleaning process. It reads directly from the raw table, not from `vw_cleaned`, so it re-applies the filters from scratch and gives you an honest audit trail.
+
+**Sample result (4 rows):**
+
+| step | row_count |
+|---|---|
+| Total raw rows | 1,067,371 |
+| After removing nulls customer_id | 824,364 |
+| After removing cancellations | 804,870 |
+| After removing non-product codes | 798,777 |
+| After removing qty and price <= 0 | 802,632 |
+
+---
 
 ### 6B — Customer subscription candidates
 
-Returns all HIGH and MEDIUM tier customers ranked by score and spend. Includes a `cadence_label` column that translates the average days between orders into plain English (Weekly, Monthly, Quarterly buyer).
+```sql
+SELECT
+    customer_id,
+    subscription_tier,
+    total_score,
+    order_count,
+    ROUND(orders_per_month, 2)           AS orders_per_month,
+    avg_days_between_orders,
+    cv_order_interval,
+    recency_days,
+    unique_products_bought,
+    total_spend,
+    avg_order_value,
+    first_order_date,
+    last_order_date,
+    CASE
+        WHEN avg_days_between_orders IS NULL    THEN 'No interval data'
+        WHEN avg_days_between_orders <= 7       THEN 'Weekly buyer'
+        WHEN avg_days_between_orders <= 30      THEN 'Monthly buyer'
+        WHEN avg_days_between_orders <= 90      THEN 'Quarterly buyer'
+        ELSE 'Low-frequency buyer'
+    END AS cadence_label
+FROM `my-project-8037-491318.a.vw_customer_subscription_score`
+WHERE subscription_tier IN ('HIGH', 'MEDIUM')
+ORDER BY
+    CASE subscription_tier WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 END,
+    total_score DESC,
+    total_spend DESC;
+```
+
+**What it does:**
+The main customer output. Reads from `vw_customer_subscription_score` and returns every HIGH and MEDIUM tier customer with their full profile and score breakdown.
+
+`WHERE subscription_tier IN ('HIGH', 'MEDIUM')` — LOW tier customers are excluded because they are not actionable subscription targets.
+
+`ORDER BY CASE subscription_tier WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 END` — sorts HIGH customers before MEDIUM ones. Within each tier, customers are ordered by score descending, then by total spend descending. This puts the most valuable, highest-scoring customers at the top.
+
+`cadence_label` translates `avg_days_between_orders` into plain English. This makes the results readable without needing to interpret numbers.
+
+---
 
 ### 6C — Customer tier summary
 
-Three-row summary table — one row per tier — with averages for order count, spend, order gap, CV, and recency. Good for a dashboard headline or presentation slide.
+```sql
+SELECT
+    subscription_tier,
+    COUNT(*)                                  AS customer_count,
+    ROUND(AVG(order_count), 1)                AS avg_order_count,
+    ROUND(AVG(orders_per_month), 2)           AS avg_orders_per_month,
+    ROUND(AVG(avg_days_between_orders), 1)    AS avg_days_between_orders,
+    ROUND(AVG(cv_order_interval), 2)          AS avg_cv,
+    ROUND(AVG(total_spend), 2)                AS avg_total_spend,
+    ROUND(AVG(recency_days), 0)               AS avg_recency_days
+FROM `my-project-8037-491318.a.vw_customer_subscription_score`
+GROUP BY subscription_tier
+ORDER BY
+    CASE subscription_tier WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END;
+```
+
+**What it does:**
+Collapses all customers into a three-row summary — one row per tier — showing average metrics for each group. This is a presentation query: it gives you the headline numbers to describe each tier at a glance.
+
+`GROUP BY subscription_tier` collapses all individual customer rows into one row per tier. `AVG()` on each metric gives the typical customer profile for that tier.
+
+**Sample result (4 rows):**
+
+| subscription_tier | customer_count | avg_order_count | avg_orders_per_month | avg_days_between_orders | avg_cv | avg_total_spend | avg_recency_days |
+|---|---|---|---|---|---|---|---|
+| HIGH | 560 | 24.7 | 1.79 | 32.5 | 0.70 | £14,665 | 21 |
+| MEDIUM | 1,759 | 8.5 | 0.64 | 79.3 | 0.80 | £3,540 | 91 |
+| LOW | 970 | 4.3 | 0.39 | 123.9 | 1.00 | £1,663 | 206 |
+
+---
 
 ### 6D — Product subscription candidates
 
-Returns all HIGH and MEDIUM tier products with a `suggested_cadence` column that recommends a subscription interval based on the average reorder days.
+```sql
+SELECT
+    stock_code,
+    description,
+    subscription_tier,
+    total_score,
+    unique_buyers,
+    repeat_buyers,
+    ROUND(repeat_buyer_rate * 100, 1)         AS repeat_buyer_pct,
+    avg_reorder_days,
+    stddev_reorder_days,
+    cv_reorder_interval,
+    total_units_sold,
+    avg_unit_price,
+    total_revenue,
+    CASE
+        WHEN avg_reorder_days IS NULL           THEN 'Insufficient reorder data'
+        WHEN avg_reorder_days <= 13             THEN 'Weekly subscription'
+        WHEN avg_reorder_days <= 45             THEN 'Monthly subscription'
+        WHEN avg_reorder_days <= 90             THEN 'Bi-monthly / quarterly'
+        WHEN avg_reorder_days <= 180            THEN 'Semi-annual subscription'
+        ELSE 'Annual or irregular — not advised'
+    END AS suggested_cadence
+FROM `my-project-8037-491318.a.vw_product_subscription_score`
+WHERE subscription_tier IN ('HIGH', 'MEDIUM')
+ORDER BY
+    CASE subscription_tier WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 END,
+    total_score DESC,
+    repeat_buyer_rate DESC;
+```
+
+**What it does:**
+The main product output — mirrors the structure of 6B but for products. Returns every HIGH and MEDIUM tier product with its full profile.
+
+`repeat_buyer_rate * 100` converts the rate from a decimal (0.43) to a percentage (43.0%) for readability.
+
+`suggested_cadence` translates `avg_reorder_days` into a recommended subscription interval. A product with an average reorder cycle of 28 days maps to a monthly subscription. A product at 70 days maps to bi-monthly. This turns a raw number into an actionable business recommendation.
+
+`ORDER BY ... repeat_buyer_rate DESC` — within the same score, products with higher repeat rates are shown first because repeat rate is the strongest individual signal.
+
+**Sample result (4 rows):**
+
+| stock_code | description | subscription_tier | total_score | unique_buyers | repeat_buyers | repeat_buyer_pct | avg_reorder_days | suggested_cadence |
+|---|---|---|---|---|---|---|---|---|
+| 84705A | English Rose Photo Frame | HIGH | 9 | 5 | 3 | 60.0% | 28.0 | Monthly subscription |
+| 21702 | Set 5 Mini Gateaux Fridge Magnets | HIGH | 8 | 5 | 2 | 40.0% | 31.0 | Monthly subscription |
+| 22837 | Hot Water Bottle Babushka | HIGH | 8 | 221 | 96 | 43.4% | 21.8 | Monthly subscription |
+| 23209 | Lunch Bag Vintage Doily | HIGH | 8 | 469 | 210 | 44.8% | 44.6 | Monthly subscription |
+
+**Sample result (4 rows):**
+
+| customer_id | subscription_tier | total_score | order_count | orders_per_month | avg_days_between_orders | cv_order_interval | recency_days | total_spend | cadence_label |
+|---|---|---|---|---|---|---|---|---|---|
+| 14096 | HIGH | 10 | 17 | 5.26 | 6.06 | 0.36 | 4 | £53,258 | Weekly buyer |
+| 12841 | HIGH | 9 | 40 | 2.33 | 13.21 | 0.65 | 4 | £7,541 | Monthly buyer |
+| 12856 | HIGH | 9 | 6 | 3.21 | 11.20 | 0.32 | 7 | £2,180 | Monthly buyer |
+| 13078 | HIGH | 9 | 57 | 2.33 | 13.12 | 0.53 | 3 | £29,532 | Monthly buyer |
+
+---
 
 ### 6E — Product tier summary
 
-Three-row summary table — one row per tier — with averages for repeat buyer rate, reorder days, unique buyers, price, and combined revenue.
+```sql
+SELECT
+    subscription_tier,
+    COUNT(*)                                  AS product_count,
+    ROUND(AVG(repeat_buyer_rate) * 100, 1)    AS avg_repeat_buyer_pct,
+    ROUND(AVG(avg_reorder_days), 1)           AS avg_reorder_days,
+    ROUND(AVG(unique_buyers), 0)              AS avg_unique_buyers,
+    ROUND(AVG(avg_unit_price), 2)             AS avg_unit_price,
+    ROUND(SUM(total_revenue), 2)              AS combined_revenue
+FROM `my-project-8037-491318.a.vw_product_subscription_score`
+GROUP BY subscription_tier
+ORDER BY
+    CASE subscription_tier WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END;
+```
+
+**What it does:**
+Same idea as 6C but for products. Three rows — one per tier — summarising the typical product profile in each group.
+
+Note that `combined_revenue` uses `SUM` rather than `AVG` — this gives you the total revenue contribution from all products in each tier, which is useful for understanding the business value of subscription-candidate products as a group.
+
+**Sample result (4 rows):**
+
+| subscription_tier | product_count | avg_repeat_buyer_pct | avg_reorder_days | avg_unique_buyers | avg_unit_price | combined_revenue |
+|---|---|---|---|---|---|---|
+| HIGH | 129 | 31.8% | 43.8 | 139 | £3.72 | £771,307 |
+| MEDIUM | 2,628 | 24.0% | 87.3 | 145 | £3.37 | £14,704,819 |
+| LOW | 1,442 | 12.6% | 143.1 | 57 | £3.89 | £1,748,483 |
+
+---
 
 ### 6F — Warmest leads
 
-Joins customer scores and product scores to find customers who have a repeat-purchase pattern *and* have already bought HIGH-tier products. These are the most actionable targets for a subscription pilot — they don't need to be convinced, they're already behaving like subscribers.
+```sql
+SELECT
+    css.customer_id,
+    css.subscription_tier                         AS customer_tier,
+    css.total_score                               AS customer_score,
+    ROUND(css.orders_per_month, 2)                AS orders_per_month,
+    css.avg_days_between_orders,
+    css.total_spend,
+    COUNT(DISTINCT pss.stock_code)                AS high_tier_products_bought,
+    STRING_AGG(DISTINCT pss.description,
+               ' | ' ORDER BY pss.description)    AS high_tier_product_names
+FROM `my-project-8037-491318.a.vw_customer_subscription_score` css
+JOIN `my-project-8037-491318.a.vw_cleaned` c
+    ON css.customer_id = c.customer_id
+JOIN `my-project-8037-491318.a.vw_product_subscription_score` pss
+    ON c.stock_code = pss.stock_code
+   AND pss.subscription_tier = 'HIGH'
+WHERE css.subscription_tier IN ('HIGH', 'MEDIUM')
+GROUP BY
+    css.customer_id, css.subscription_tier, css.total_score,
+    css.orders_per_month, css.avg_days_between_orders, css.total_spend
+ORDER BY
+    CASE css.subscription_tier WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 END,
+    high_tier_products_bought DESC,
+    css.total_score DESC;
+```
+
+**What it does:**
+The most actionable query in the project. It finds customers who satisfy two conditions at once: they have a subscription-friendly ordering pattern (HIGH or MEDIUM tier) AND they have already purchased at least one HIGH-tier subscription product.
+
+It does this with two JOINs — first joining to `vw_cleaned` to get which products each customer has bought, then joining to `vw_product_subscription_score` filtered to `subscription_tier = 'HIGH'` to keep only the purchases of top-tier products.
+
+`COUNT(DISTINCT pss.stock_code)` counts how many different HIGH-tier products each customer has bought. A customer who has bought five subscription-friendly products is a warmer lead than one who has bought just one.
+
+`STRING_AGG(DISTINCT pss.description, ' | ' ORDER BY pss.description)` concatenates all the HIGH-tier product names into a single readable string per customer, separated by pipes. This lets you see at a glance what subscription-friendly products each customer already buys.
+
+**Sample result (4 rows):**
+
+| customer_id | customer_tier | customer_score | orders_per_month | avg_days_between_orders | total_spend | high_tier_products_bought |
+|---|---|---|---|---|---|---|
+| 14911 | HIGH | 7 | 15.18 | 1.98 | £276,655 | 84 |
+| 17841 | HIGH | 9 | 8.60 | 3.50 | £70,847 | 73 |
+| 12748 | HIGH | 7 | 13.14 | 2.29 | £52,191 | 68 |
+| 14298 | HIGH | 7 | 3.42 | 8.89 | £91,194 | 62 |
+
+---
 
 ### 6G — Country breakdown
 
-Groups subscription candidates by country to identify where to run a geographic pilot. 500 of 560 HIGH-tier customers are in the UK.
+```sql
+SELECT
+    c.country,
+    COUNT(DISTINCT css.customer_id)               AS candidate_customers,
+    COUNTIF(css.subscription_tier = 'HIGH')       AS high_tier,
+    COUNTIF(css.subscription_tier = 'MEDIUM')     AS medium_tier,
+    ROUND(AVG(css.total_spend), 2)                AS avg_spend_per_customer
+FROM `my-project-8037-491318.a.vw_customer_subscription_score` css
+JOIN `my-project-8037-491318.a.vw_cleaned` c
+    ON css.customer_id = c.customer_id
+WHERE css.subscription_tier IN ('HIGH', 'MEDIUM')
+GROUP BY c.country
+ORDER BY candidate_customers DESC;
+```
+
+**What it does:**
+Groups subscription candidates by country to identify the best geography for a pilot launch.
+
+It joins `vw_customer_subscription_score` to `vw_cleaned` to get the country for each customer. `COUNTIF(css.subscription_tier = 'HIGH')` is a BigQuery shorthand that counts only the rows matching a condition — equivalent to `COUNT(CASE WHEN ... THEN 1 END)` in standard SQL. It lets us split the count into HIGH and MEDIUM in the same row without a subquery.
+
+`GROUP BY c.country` produces one row per country. Ordered by total candidate count descending so the most promising markets appear first.
+
+**Sample result (4 rows):**
+
+| country | candidate_customers | high_tier | medium_tier | avg_spend_per_customer |
+|---|---|---|---|---|
+| United Kingdom | 2,113 | 500 | 1,613 | £5,678 |
+| Germany | 49 | 21 | 28 | £6,584 |
+| France | 47 | 17 | 30 | £6,167 |
+| Belgium | 14 | 5 | 9 | £3,585 |
